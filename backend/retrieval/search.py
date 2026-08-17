@@ -39,8 +39,31 @@ class HybridSearcher:
         match = re.search(r"(?:^|[_\s-])v(\d+)(?:\.|[_\s-]|$)", filename.lower())
         return int(match.group(1)) if match else None
 
+    @staticmethod
+    def _infer_intent_filters(query: str, filters: Dict[str, Any]) -> Dict[str, Any]:
+        """Fill soft intent hints even when an older QueryAnalyzer is deployed."""
+        q = query.lower()
+        inferred = dict(filters or {})
+        if "document_family" not in inferred:
+            if any(x in q for x in ("idempotency", "api v2", "api version")):
+                inferred["document_family"] = "integration"
+            elif "reconciliation" in q:
+                inferred["document_family"] = "reconciliation"
+            elif any(x in q for x in ("kyc", "entity x", "edd", "enhanced due diligence")):
+                inferred["document_family"] = "compliance"
+            elif any(x in q for x in ("settlement", "settle")):
+                inferred["document_family"] = "settlement"
+        if "document_focus" not in inferred and any(x in q for x in ("policy", "settlement window", "current")):
+            inferred["document_focus"] = "policy"
+        if "version_policy" not in inferred:
+            if any(x in q for x in ("current", "latest", "currently", "standard settlement window")):
+                inferred["version_policy"] = "current_only"
+            elif any(x in q for x in ("what changed", "compare v1", "v1 and v2", "between v1 and v2")):
+                inferred["version_policy"] = "compare_versions"
+        return inferred
+
     def search(self, db: Session, query: str, filters: Dict[str, Any] = None, top_k: int = 15, organization_id: str = None) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-        filters = filters or {}
+        filters = self._infer_intent_filters(query, filters)
         t0 = time.perf_counter()
         query_embedding = embedding_provider.embed_text(query)
         base_query = (
@@ -119,8 +142,6 @@ class HybridSearcher:
                 if "july" in filename or "july 14" in content:
                     combined += 0.40
 
-            # Current-policy questions must prefer the highest policy version and
-            # exclude superseded versions before final context selection.
             if filters.get("version_policy") == "current_only" and "policy" in filename:
                 version = self._version_number(filename)
                 if version is not None:
@@ -139,16 +160,14 @@ class HybridSearcher:
                 version = self._version_number(name)
                 if version is not None:
                     policy_versions[partner] = max(policy_versions.get(partner, 0), version)
-            if policy_versions:
-                filtered = []
-                for item in final_list:
-                    name = item["doc"].filename.lower()
-                    partner = (item["doc"].partner or "global").lower()
-                    version = self._version_number(name)
-                    if "policy" in name and version is not None and version < policy_versions.get(partner, version):
-                        continue
-                    filtered.append(item)
-                final_list = filtered
+            final_list = [
+                item for item in final_list
+                if not (
+                    "policy" in item["doc"].filename.lower()
+                    and self._version_number(item["doc"].filename.lower()) is not None
+                    and self._version_number(item["doc"].filename.lower()) < policy_versions.get((item["doc"].partner or "global").lower(), 0)
+                )
+            ]
 
         final_list.sort(key=lambda x: x["combined_score"], reverse=True)
         if final_list:
