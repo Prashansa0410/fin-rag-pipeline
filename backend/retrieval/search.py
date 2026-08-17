@@ -29,12 +29,15 @@ class HybridSearcher:
             query = query.where((Document.business_domain == filters["business_domain"]) | Document.business_domain.is_(None) | (Document.business_domain == ""))
         if "month" in filters:
             start, end = HybridSearcher._month_bounds(filters["month"])
-            # Keep undated documents for semantic recall; month-specific filenames
-            # are handled by the ranking stage below.
             query = query.where(or_(and_(Document.effective_date >= start, Document.effective_date < end), Document.effective_date.is_(None)))
         if organization_id:
             query = query.where(Document.organization_id == organization_id)
         return query
+
+    @staticmethod
+    def _version_number(filename: str):
+        match = re.search(r"(?:^|[_\s-])v(\d+)(?:\.|[_\s-]|$)", filename.lower())
+        return int(match.group(1)) if match else None
 
     def search(self, db: Session, query: str, filters: Dict[str, Any] = None, top_k: int = 15, organization_id: str = None) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         filters = filters or {}
@@ -110,19 +113,47 @@ class HybridSearcher:
             if filters.get("document_focus") == "policy" and "policy" in filename:
                 combined += 0.55
 
-            # Incident questions should favor incident evidence while still retaining
-            # policy/settlement evidence needed to explain the outcome.
-            if family == "settlement" and any(term in q for term in ("why", "delayed", "delay", "july 14")) and "incident" in filename:
-                combined += 0.45
+            if family == "settlement" and any(term in q for term in ("why", "delayed", "delay", "july 14")):
+                if "incident" in filename:
+                    combined += 0.45
+                if "july" in filename or "july 14" in content:
+                    combined += 0.40
+
+            # Current-policy questions must prefer the highest policy version and
+            # exclude superseded versions before final context selection.
+            if filters.get("version_policy") == "current_only" and "policy" in filename:
+                version = self._version_number(filename)
+                if version is not None:
+                    combined += 0.20 * version
 
             data.update({"lexical_score": relevance["lexical"], "filename_score": relevance["filename"], "phrase_score": relevance["phrase"], "combined_score": combined})
             final_list.append(data)
+
+        if filters.get("version_policy") == "current_only":
+            policy_versions: Dict[str, int] = {}
+            for item in final_list:
+                name = item["doc"].filename.lower()
+                if "policy" not in name:
+                    continue
+                partner = (item["doc"].partner or "global").lower()
+                version = self._version_number(name)
+                if version is not None:
+                    policy_versions[partner] = max(policy_versions.get(partner, 0), version)
+            if policy_versions:
+                filtered = []
+                for item in final_list:
+                    name = item["doc"].filename.lower()
+                    partner = (item["doc"].partner or "global").lower()
+                    version = self._version_number(name)
+                    if "policy" in name and version is not None and version < policy_versions.get(partner, version):
+                        continue
+                    filtered.append(item)
+                final_list = filtered
 
         final_list.sort(key=lambda x: x["combined_score"], reverse=True)
         if final_list:
             top_score = final_list[0]["combined_score"]
             is_comparison = "compare" in q or "difference" in q
-            # Tight precision for simple facts; broader context for comparison/incident reasoning.
             ratio = 0.88 if not is_comparison and not any(term in q for term in ("why", "delayed", "delay")) else 0.68
             threshold = max(0.48, top_score * ratio)
             gated = [r for r in final_list if r["combined_score"] >= threshold]
