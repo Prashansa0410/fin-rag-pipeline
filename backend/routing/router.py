@@ -9,6 +9,7 @@ class IntelligentRouter:
         reason = "Moderate complexity standard query."
         requires_review = False
         query_lower = query.lower()
+        high_risk_language = any(term in query_lower for term in ("kyc", "edd", "enhanced due diligence", "compliance", "high risk", "audit"))
 
         if not settings.MODEL_ROUTING_ENABLED:
             target_tier = "advanced"
@@ -17,9 +18,9 @@ class IntelligentRouter:
             target_tier = "advanced"
             reason = "Conflicting evidence detected, routing to advanced for resolution."
             requires_review = True
-        elif risk_level == "HIGH" or query_type == QueryType.COMPLIANCE:
+        elif high_risk_language or risk_level == "HIGH" or query_type == QueryType.COMPLIANCE or query_type == QueryType.HIGH_RISK:
             target_tier = "advanced"
-            reason = "High risk or compliance query requires advanced model."
+            reason = "High-risk financial/compliance query requires advanced reasoning and human review."
             requires_review = True
         elif query_type == QueryType.COMPARISON or query_type == QueryType.MULTI_DOCUMENT_ANALYSIS:
             target_tier = "advanced"
@@ -28,9 +29,9 @@ class IntelligentRouter:
             target_tier = "advanced"
             reason = "Versioned policy query with temporal applicability requires advanced reasoning."
         elif query_type in [QueryType.SIMPLE_FACT, QueryType.TECHNICAL_DOCUMENTATION]:
-            if retrieval_confidence >= 0.65:
+            if retrieval_confidence >= 0.60:
                 target_tier = "economical"
-                reason = "Simple query with high retrieval confidence."
+                reason = "Simple query with sufficient retrieval confidence."
             else:
                 target_tier = "standard"
                 reason = "Simple query with moderate retrieval confidence."
@@ -45,12 +46,7 @@ class IntelligentRouter:
 
         model_info = registry.get_model_info(target_tier)
         if model_info.get("health_status") == "unhealthy":
-            return {
-                "tier": "fallback",
-                "reason": f"Original target '{target_tier}' was unhealthy. Falling back.",
-                "requires_review": requires_review,
-            }
-
+            return {"tier": "fallback", "reason": f"Original target '{target_tier}' was unhealthy. Falling back.", "requires_review": requires_review}
         return {"tier": target_tier, "reason": reason, "requires_review": requires_review}
 
 
