@@ -6,22 +6,12 @@ from sqlalchemy import select, desc, func
 from backend.database.models import DocumentChunk, DocumentVersion, Document
 from backend.embeddings.provider import embedding_provider
 from backend.config import settings
+from backend.retrieval.relevance import relevance_scorer
 
 
 class HybridSearcher:
     def __init__(self):
         pass
-
-    @staticmethod
-    def _terms(text: str) -> List[str]:
-        return [t for t in re.findall(r"[a-z0-9]+", text.lower()) if len(t) > 1]
-
-    def _lexical_score(self, query: str, content: str, filename: str) -> float:
-        query_terms = set(self._terms(query))
-        if not query_terms:
-            return 0.0
-        doc_terms = set(self._terms(f"{filename} {content}"))
-        return len(query_terms & doc_terms) / len(query_terms)
 
     def search(self, db: Session, query: str, filters: Dict[str, Any] = None, top_k: int = 15, organization_id: str = None) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         filters = filters or {}
@@ -55,7 +45,10 @@ class HybridSearcher:
         vector_candidates = db.execute(base_query.order_by("vector_distance").limit(top_k * 3)).all()
         t2 = time.perf_counter()
 
-        ts_query_str = " & ".join([word for word in query.replace("'", "").split() if word.isalnum()])
+        # Use PostgreSQL FTS as a recall mechanism. Exact phrase/term relevance is
+        # handled deterministically below so broad FTS matches do not flood context.
+        query_words = [w for w in re.findall(r"[a-zA-Z0-9]+", query) if len(w) > 1]
+        ts_query_str = " & ".join(query_words)
         keyword_candidates = []
         if ts_query_str:
             kw_query = (
@@ -80,13 +73,13 @@ class HybridSearcher:
                 )
             if organization_id:
                 kw_query = kw_query.where(Document.organization_id == organization_id)
-            keyword_candidates = db.execute(kw_query.order_by(desc("rank")).limit(top_k * 2)).all()
+            keyword_candidates = db.execute(kw_query.order_by(desc("rank")).limit(top_k * 3)).all()
 
         t3 = time.perf_counter()
         merged_results = {}
 
         for chunk, version, doc, distance in vector_candidates:
-            similarity = max(0.0, 1.0 - (distance / 2.0))
+            similarity = max(0.0, 1.0 - (float(distance) / 2.0))
             merged_results[chunk.id] = {
                 "chunk": chunk, "version": version, "doc": doc,
                 "vector_score": similarity, "keyword_score": 0.0
@@ -105,32 +98,59 @@ class HybridSearcher:
                 }
 
         final_list = []
+        query_lower = query.lower()
         for data in merged_results.values():
             chunk = data["chunk"]
             doc = data["doc"]
-            lexical_score = self._lexical_score(query, chunk.content, doc.filename)
+            relevance = relevance_scorer.score(query, chunk.content, doc.filename)
+
+            # Favor exact operational terminology while retaining semantic recall.
             combined = (
                 settings.VECTOR_WEIGHT * data["vector_score"] +
                 settings.KEYWORD_WEIGHT * data["keyword_score"] +
-                settings.LEXICAL_WEIGHT * lexical_score
+                settings.LEXICAL_WEIGHT * relevance["lexical"]
             )
-            data["lexical_score"] = lexical_score
-            data["combined_score"] = combined
+            combined += 0.10 * relevance["filename"]
+            combined += 0.10 * relevance["phrase"]
+
+            # A direct phrase/identifier match should not be buried by unrelated
+            # semantically similar documents.
+            if relevance["phrase"] > 0:
+                combined += 0.10
+
+            data.update({
+                "lexical_score": relevance["lexical"],
+                "filename_score": relevance["filename"],
+                "phrase_score": relevance["phrase"],
+                "combined_score": combined,
+            })
             final_list.append(data)
 
         final_list.sort(key=lambda x: x["combined_score"], reverse=True)
-        t4 = time.perf_counter()
 
+        # Relevance gate: for ordinary factual queries, do not pass a long tail of
+        # weakly related chunks into the LLM. Keep a small fallback set when the
+        # query genuinely has weak lexical evidence so semantic retrieval can still work.
+        if final_list:
+            top_score = final_list[0]["combined_score"]
+            is_comparison = "compare" in query_lower or "difference" in query_lower
+            threshold = max(0.32, top_score * 0.72)
+            gated = [r for r in final_list if r["combined_score"] >= threshold]
+            max_results = min(top_k, 8 if is_comparison else 5)
+            final_list = gated[:max_results]
+
+        t4 = time.perf_counter()
         metrics = {
             "query_analysis_latency_ms": int((t1 - t0) * 1000),
             "vector_search_latency_ms": int((t2 - t1) * 1000),
             "keyword_search_latency_ms": int((t3 - t2) * 1000),
             "merge_latency_ms": int((t4 - t3) * 1000),
-            "candidate_count": len(final_list)
+            "candidate_count": len(merged_results),
+            "returned_count": len(final_list),
         }
 
         formatted_results = []
-        for item in final_list[:top_k]:
+        for item in final_list:
             chunk = item["chunk"]
             doc = item["doc"]
             formatted_results.append({
@@ -145,7 +165,9 @@ class HybridSearcher:
                 "score": item["combined_score"],
                 "vector_score": item["vector_score"],
                 "keyword_score": item["keyword_score"],
-                "lexical_score": item["lexical_score"]
+                "lexical_score": item["lexical_score"],
+                "filename_score": item["filename_score"],
+                "phrase_score": item["phrase_score"],
             })
 
         return formatted_results, metrics
