@@ -1,0 +1,56 @@
+[
+  {
+    "question": "What is the standard settlement window for Partner A?",
+    "expected_sources": [
+      "partner_a_policy_v2.md"
+    ],
+    "expected_risk": "low",
+    "expected_model_tier": "economical"
+  },
+  {
+    "question": "What does API V2 specify for idempotency keys?",
+    "expected_sources": [
+      "api_v2_spec.md"
+    ],
+    "expected_risk": "low",
+    "expected_model_tier": "economical"
+  },
+  {
+    "question": "Why was Partner A's July 14 settlement delayed?",
+    "expected_sources": [
+      "july_2026_settlement.md",
+      "partner_a_settlement_incident.md",
+      "partner_a_policy_v2.md"
+    ],
+    "expected_risk": "medium",
+    "expected_model_tier": "standard"
+  },
+  {
+    "question": "Compare Partner A and Partner B reconciliation issues in July.",
+    "expected_sources": [
+      "partner_a_recon.md",
+      "partner_b_recon.md"
+    ],
+    "expected_risk": "medium",
+    "expected_model_tier": "advanced"
+  },
+  {
+    "question": "Does Entity X transaction require enhanced KYC review?",
+    "expected_sources": [
+      "kyc_exception_report.md",
+      "financial_operations_handbook.md"
+    ],
+    "expected_risk": "high",
+    "expected_model_tier": "advanced",
+    "expected_review": true
+  },
+  {
+    "question": "What is the current Partner A settlement policy for transactions after 18:00 UTC?",
+    "expected_sources": [
+      "partner_a_policy_v2.md",
+      "partner_a_policy_v1.md"
+    ],
+    "expected_risk": "medium",
+    "expected_model_tier": "advanced"
+  }
+]
