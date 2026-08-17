@@ -10,26 +10,46 @@ class RetrievalConfidenceAnalyzer:
     def _normalized_name(name: str) -> str:
         return re.sub(r"[^a-z0-9]+", " ", name.lower()).strip()
 
+    @staticmethod
+    def _policy_version(name: str):
+        match = re.search(r"(?:^|[_\s-])v(\d+)(?:\.|[_\s-]|$)", name.lower())
+        return int(match.group(1)) if match else None
+
     def _superseded_documents(self, results: List[Dict[str, Any]]) -> set[str]:
-        """Find documents explicitly superseded by a newer policy/version."""
         superseded: set[str] = set()
-        names = {self._normalized_name(r.get("document_name", "")): r.get("document_name", "") for r in results}
         for res in results:
             content = res.get("content", "")
             current_name = res.get("document_name", "")
-            for match in re.findall(r"supersedes\s+([^\.\n]+)", content, re.IGNORECASE):
-                target = self._normalized_name(match)
-                for normalized, original in names.items():
-                    if target and (target in normalized or normalized in target):
-                        if original != current_name:
-                            superseded.add(original)
+            if not re.search(r"supersedes\s+", content, re.IGNORECASE):
+                continue
+
+            # Synthetic/real policy documents often refer to the old policy by a
+            # longer title than the stored filename. Match by partner + version,
+            # not by exact filename text.
+            targets = re.findall(r"supersedes\s+([^\.\n]+)", content, re.IGNORECASE)
+            for target in targets:
+                target_version = self._policy_version(target)
+                target_norm = self._normalized_name(target)
+                current_norm = self._normalized_name(current_name)
+                for other in results:
+                    other_name = other.get("document_name", "")
+                    if other_name == current_name:
+                        continue
+                    other_norm = self._normalized_name(other_name)
+                    if target_version is not None and self._policy_version(other_name) == target_version:
+                        # Require a meaningful shared policy/partner identity.
+                        target_tokens = set(target_norm.split())
+                        other_tokens = set(other_norm.split())
+                        if ("partner" in target_tokens and "partner" in other_tokens) or "policy" in other_tokens:
+                            superseded.add(other_name)
+                    elif target_norm and (target_norm in other_norm or other_norm in target_norm):
+                        superseded.add(other_name)
         return superseded
 
     def analyze_confidence(self, results: List[Dict[str, Any]]) -> Tuple[float, str, bool, List[Dict[str, Any]]]:
         if not results:
             return 0.0, "LOW", False, []
 
-        # Enforce source diversity: no more than 3 chunks from one document.
         counts: Dict[str, int] = {}
         diverse_results = []
         for res in results:
@@ -39,13 +59,10 @@ class RetrievalConfidenceAnalyzer:
             counts[doc_name] = counts.get(doc_name, 0) + 1
             diverse_results.append(res)
 
-        # Version supersession is not a conflict. A newer policy explicitly saying it
-        # supersedes an older policy should cause the older policy to be ignored for
-        # contradiction analysis, while still allowing it to be returned as provenance.
         superseded_docs = self._superseded_documents(diverse_results)
-
         has_conflict = False
         partner_doc_rules: Dict[str, Dict[str, set]] = {}
+
         for res in diverse_results[:8]:
             doc_name = res.get("document_name", "")
             if doc_name in superseded_docs:
@@ -61,8 +78,6 @@ class RetrievalConfidenceAnalyzer:
                 if matches:
                     partner_doc_rules.setdefault(partner, {}).setdefault(doc_name, set()).update(matches)
 
-        # Only compare rules within the same partner/scope. Partner A T+1 vs Partner B
-        # T+2 is expected policy variation, not contradictory evidence.
         for docs in partner_doc_rules.values():
             if len(docs) > 1:
                 all_rules = set().union(*docs.values())
