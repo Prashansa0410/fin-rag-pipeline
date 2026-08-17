@@ -7,12 +7,12 @@ class Settings(BaseSettings):
     DATABASE_URL: str = "postgresql://postgres:password@localhost:5432/finresearch"
     REDIS_URL: str = "redis://localhost:6379/0"
 
-    # Model IDs are configuration, not routing logic. They can be overridden
-    # safely through .env / deployment secrets as Hugging Face availability changes.
-    ECONOMICAL_MODEL: str = "Qwen/Qwen2.5-1.5B-Instruct"
-    STANDARD_MODEL: str = "mistralai/Mistral-Nemo-Instruct-2407"
+    # General-purpose instruction models with current Hugging Face Inference Provider support.
+    # Keep these configurable because provider/model availability can change.
+    ECONOMICAL_MODEL: str = "meta-llama/Llama-3.2-3B-Instruct"
+    STANDARD_MODEL: str = "Qwen/Qwen3-4B-Instruct-2507"
     ADVANCED_MODEL: str = "Qwen/Qwen2.5-72B-Instruct"
-    FALLBACK_MODEL: str = "Qwen/Qwen2.5-1.5B-Instruct"
+    FALLBACK_MODEL: str = "meta-llama/Llama-3.2-3B-Instruct"
 
     EMBEDDING_MODEL: str = "sentence-transformers/all-MiniLM-L6-v2"
 
@@ -26,8 +26,9 @@ class Settings(BaseSettings):
 
     RATE_LIMIT: str = "30/minute"
 
-    VECTOR_WEIGHT: float = 0.7
-    KEYWORD_WEIGHT: float = 0.3
+    VECTOR_WEIGHT: float = 0.60
+    KEYWORD_WEIGHT: float = 0.25
+    LEXICAL_WEIGHT: float = 0.15
     METADATA_BOOST: float = 0.2
 
     class Config:
