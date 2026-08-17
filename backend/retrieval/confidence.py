@@ -22,22 +22,16 @@ class RetrievalConfidenceAnalyzer:
             current_name = res.get("document_name", "")
             if not re.search(r"supersedes\s+", content, re.IGNORECASE):
                 continue
-
-            # Synthetic/real policy documents often refer to the old policy by a
-            # longer title than the stored filename. Match by partner + version,
-            # not by exact filename text.
             targets = re.findall(r"supersedes\s+([^\.\n]+)", content, re.IGNORECASE)
             for target in targets:
                 target_version = self._policy_version(target)
                 target_norm = self._normalized_name(target)
-                current_norm = self._normalized_name(current_name)
                 for other in results:
                     other_name = other.get("document_name", "")
                     if other_name == current_name:
                         continue
                     other_norm = self._normalized_name(other_name)
                     if target_version is not None and self._policy_version(other_name) == target_version:
-                        # Require a meaningful shared policy/partner identity.
                         target_tokens = set(target_norm.split())
                         other_tokens = set(other_norm.split())
                         if ("partner" in target_tokens and "partner" in other_tokens) or "policy" in other_tokens:
@@ -60,13 +54,12 @@ class RetrievalConfidenceAnalyzer:
             diverse_results.append(res)
 
         superseded_docs = self._superseded_documents(diverse_results)
+        evidence = [r for r in diverse_results if r.get("document_name") not in superseded_docs]
+
         has_conflict = False
         partner_doc_rules: Dict[str, Dict[str, set]] = {}
-
-        for res in diverse_results[:8]:
+        for res in evidence[:8]:
             doc_name = res.get("document_name", "")
-            if doc_name in superseded_docs:
-                continue
             lowered_name = doc_name.lower()
             if any(word in lowered_name for word in ("incident", "recon", "summary", "report")):
                 continue
@@ -79,23 +72,39 @@ class RetrievalConfidenceAnalyzer:
                     partner_doc_rules.setdefault(partner, {}).setdefault(doc_name, set()).update(matches)
 
         for docs in partner_doc_rules.values():
-            if len(docs) > 1:
-                all_rules = set().union(*docs.values())
-                if len(all_rules) > 1:
-                    has_conflict = True
-                    break
+            if len(docs) > 1 and len(set().union(*docs.values())) > 1:
+                has_conflict = True
+                break
 
-        top_score = float(diverse_results[0].get("score", 0.0)) if diverse_results else 0.0
-        if top_score > 0.8 and not has_conflict:
-            confidence_level = "HIGH"
-        elif top_score > 0.6:
-            confidence_level = "MEDIUM"
-        else:
-            confidence_level = "LOW"
+        top = float(evidence[0].get("score", 0.0)) if evidence else 0.0
+        second = float(evidence[1].get("score", 0.0)) if len(evidence) > 1 else 0.0
+        margin = max(0.0, min(1.0, top - second))
+        lexical = float(evidence[0].get("lexical_score", 0.0)) if evidence else 0.0
+        filename = float(evidence[0].get("filename_score", 0.0)) if evidence else 0.0
+        phrase = float(evidence[0].get("phrase_score", 0.0)) if evidence else 0.0
+        source_concentration = 1.0 / len({r.get("document_name") for r in evidence}) if evidence else 0.0
+
+        confidence = min(1.0, (
+            0.45 * min(1.0, top) +
+            0.20 * lexical +
+            0.10 * filename +
+            0.10 * phrase +
+            0.10 * margin +
+            0.05 * source_concentration
+        ))
         if has_conflict:
-            confidence_level = "MEDIUM"
+            confidence *= 0.75
 
-        return top_score, confidence_level, has_conflict, diverse_results
+        if has_conflict:
+            level = "MEDIUM"
+        elif confidence >= 0.70 or (top >= 0.65 and lexical >= 0.70 and margin >= 0.08):
+            level = "HIGH"
+        elif confidence >= 0.48:
+            level = "MEDIUM"
+        else:
+            level = "LOW"
+
+        return confidence, level, has_conflict, evidence
 
 
 confidence_analyzer = RetrievalConfidenceAnalyzer()
