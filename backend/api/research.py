@@ -1,5 +1,4 @@
 import time
-import traceback
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
@@ -47,6 +46,7 @@ async def perform_research(request: ResearchRequest, db: Session = Depends(get_d
                 context_tokens=context_opt["optimized_context_tokens"],
                 risk_level="HIGH" if analysis["is_high_risk"] else "LOW",
                 conflicting_evidence=has_conflict,
+                query=request.query,
             )
 
         target_tier = routing_decision["tier"]
@@ -56,9 +56,13 @@ async def perform_research(request: ResearchRequest, db: Session = Depends(get_d
         usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "estimated_cost": 0.0}
         llm_latency_ms = 0
         regeneration_latency_ms = 0
+        grounding_latency_ms = 0
+        validation_estimated_cost = 0.0
 
         if context_opt["optimized_context_tokens"] == 0:
-            generated_answer = "Insufficient evidence found in the retrieved context to answer this query safely."
+            generated_answer = "I couldn't find sufficient evidence in the connected knowledge base to answer this query reliably."
+            is_grounded = False
+            validation_reason = "No supporting evidence was retrieved."
         else:
             prompt = prompt_manager.build_research_prompt(request.query, final_chunks)
             t_gen_start = time.perf_counter()
@@ -70,36 +74,31 @@ async def perform_research(request: ResearchRequest, db: Session = Depends(get_d
             generated_answer = response["answer"]
             usage = response.get("usage", usage)
 
-        # Validator latency is already milliseconds. Never multiply it by 1000.
-        is_grounded, validation_reason, grounding_latency_ms = await grounding_validator.validate_grounding(
-            request.query, generated_answer, final_chunks
-        )
-        validation_estimated_cost = _estimated_registry_cost(
-            "economical", context_opt["optimized_context_tokens"], 150
-        ) if final_chunks else 0.0
-
-        if not is_grounded and context_opt["optimized_context_tokens"] > 0:
-            regenerate_prompt = prompt_manager.build_regeneration_prompt(request.query, final_chunks)
-            t_regen_start = time.perf_counter()
-            try:
-                response2 = await huggingface_provider.generate(model_id, regenerate_prompt)
-            except Exception as e:
-                raise HTTPException(status_code=500, detail=f"LLM Provider Error (Regeneration): {type(e).__name__} - {e}")
-            regeneration_latency_ms = int((time.perf_counter() - t_regen_start) * 1000)
-            generated_answer = response2["answer"]
-            usage2 = response2.get("usage", {})
-            usage["input_tokens"] += usage2.get("input_tokens", 0)
-            usage["output_tokens"] += usage2.get("output_tokens", 0)
-            usage["total_tokens"] += usage2.get("total_tokens", 0)
-            usage["estimated_cost"] = (usage.get("estimated_cost") or 0.0) + (usage2.get("estimated_cost") or 0.0)
-
-            is_grounded, validation_reason, second_grounding_latency_ms = await grounding_validator.validate_grounding(
+            is_grounded, validation_reason, grounding_latency_ms = await grounding_validator.validate_grounding(
                 request.query, generated_answer, final_chunks
             )
-            grounding_latency_ms += second_grounding_latency_ms
-            validation_estimated_cost += _estimated_registry_cost(
-                "economical", context_opt["optimized_context_tokens"], 150
-            )
+            validation_estimated_cost = _estimated_registry_cost("economical", context_opt["optimized_context_tokens"], 150)
+
+            if not is_grounded:
+                regenerate_prompt = prompt_manager.build_regeneration_prompt(request.query, final_chunks)
+                t_regen_start = time.perf_counter()
+                try:
+                    response2 = await huggingface_provider.generate(model_id, regenerate_prompt)
+                except Exception as e:
+                    raise HTTPException(status_code=500, detail=f"LLM Provider Error (Regeneration): {type(e).__name__} - {e}")
+                regeneration_latency_ms = int((time.perf_counter() - t_regen_start) * 1000)
+                generated_answer = response2["answer"]
+                usage2 = response2.get("usage", {})
+                usage["input_tokens"] += usage2.get("input_tokens", 0)
+                usage["output_tokens"] += usage2.get("output_tokens", 0)
+                usage["total_tokens"] += usage2.get("total_tokens", 0)
+                usage["estimated_cost"] = (usage.get("estimated_cost") or 0.0) + (usage2.get("estimated_cost") or 0.0)
+
+                is_grounded, validation_reason, second_grounding_latency_ms = await grounding_validator.validate_grounding(
+                    request.query, generated_answer, final_chunks
+                )
+                grounding_latency_ms += second_grounding_latency_ms
+                validation_estimated_cost += _estimated_registry_cost("economical", context_opt["optimized_context_tokens"], 150)
 
         t_end = time.perf_counter()
         requires_review = routing_decision["requires_review"] or not is_grounded
@@ -120,11 +119,10 @@ async def perform_research(request: ResearchRequest, db: Session = Depends(get_d
             query_analysis_latency_ms=metrics["query_analysis_latency_ms"],
             retrieval_latency_ms=metrics["vector_search_latency_ms"] + metrics["keyword_search_latency_ms"] + metrics["merge_latency_ms"],
             llm_latency_ms=llm_latency_ms, grounding_latency_ms=int(grounding_latency_ms),
-            regeneration_latency_ms=regeneration_latency_ms,
-            candidate_context_tokens=context_opt["original_context_tokens"], final_context_tokens=context_opt["optimized_context_tokens"],
-            tokens_removed=context_opt["tokens_saved"], retrieval_confidence=conf_score,
-            retrieval_confidence_level=conf_level, conflicting_evidence_detected=has_conflict,
-            answer_text=generated_answer, requires_review=requires_review,
+            regeneration_latency_ms=regeneration_latency_ms, candidate_context_tokens=context_opt["original_context_tokens"],
+            final_context_tokens=context_opt["optimized_context_tokens"], tokens_removed=context_opt["tokens_saved"],
+            retrieval_confidence=conf_score, retrieval_confidence_level=conf_level,
+            conflicting_evidence_detected=has_conflict, answer_text=generated_answer, requires_review=requires_review,
             input_tokens=usage["input_tokens"], output_tokens=usage["output_tokens"], total_tokens=usage["total_tokens"],
             estimated_cost=total_estimated_cost, baseline_cost=baseline_cost, routing_savings=routing_savings,
         )
@@ -137,15 +135,13 @@ async def perform_research(request: ResearchRequest, db: Session = Depends(get_d
         return {
             "answer": generated_answer, "is_grounded": is_grounded, "validation_reason": validation_reason,
             "requires_review": requires_review, "confidence": conf_level, "selected_model_tier": target_tier,
-            "citations": [{"source_id": c.get("metadata", {}).get("source_id", "Unknown")} for c in final_chunks],
-            "metrics": {
-                "latency": db_request.total_latency_ms, "tier": target_tier, "model": model_id,
-                "estimated_cost": total_estimated_cost, "baseline_cost": baseline_cost,
-                "routing_savings": routing_savings, "llm_latency_ms": llm_latency_ms,
-                "grounding_latency_ms": int(grounding_latency_ms), "regeneration_latency_ms": regeneration_latency_ms,
-            },
+            "citations": [{"source_id": c.get("metadata", {}).get("source_id", c.get("document_name", "Unknown"))} for c in final_chunks],
+            "metrics": {"latency": db_request.total_latency_ms, "tier": target_tier, "model": model_id,
+                        "estimated_cost": total_estimated_cost, "baseline_cost": baseline_cost,
+                        "routing_savings": routing_savings, "llm_latency_ms": llm_latency_ms,
+                        "grounding_latency_ms": int(grounding_latency_ms), "regeneration_latency_ms": regeneration_latency_ms},
         }
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}\n{traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=f"Research request failed: {type(e).__name__} - {e}")
